@@ -1,3 +1,11 @@
+// Supabase Configuration
+// PLEASE REPLACE THESE WITH YOUR ACTUAL SUPABASE CREDENTIALS
+const SUPABASE_URL = "YOUR_ACTUAL_SUPABASE_PROJECT_URL";
+const SUPABASE_ANON_KEY = "YOUR_ACTUAL_SUPABASE_ANON_KEY";
+
+// Create Supabase client only if credentials are provided to prevent errors
+const supabase = (SUPABASE_URL.includes('YOUR_')) ? null : window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
 // State
 let emails = [];
 let currentCategory = 'inbox';
@@ -32,18 +40,13 @@ const mobileThemeBtn = document.getElementById('mobileThemeBtn');
 const emailCountDisplay = document.getElementById('emailCountDisplay');
 const toastContainer = document.getElementById('toastContainer');
 
-// Compose Elements
 const composeTo = document.getElementById('composeTo');
 const composeSubject = document.getElementById('composeSubject');
 const composeBody = document.getElementById('composeBody');
 const sendEmailBtn = document.getElementById('sendEmailBtn');
 
 // Initialize App
-function init() {
-    loadEmails();
-    renderSidebar();
-    renderEmailList();
-    setupEventListeners();
+async function init() {
     checkResponsive();
     
     // Check saved theme
@@ -53,21 +56,114 @@ function init() {
     } else {
         document.documentElement.classList.remove('dark');
     }
+
+    if (!supabase) {
+        // Fallback to local storage if Supabase isn't configured yet
+        showToast("Supabase keys missing. Running in local mode.", "info");
+        loadLocalEmails();
+    } else {
+        await fetchEmailsFromSupabase();
+        setupRealtimeSubscription();
+    }
+    
+    renderSidebar();
+    renderEmailList();
+    setupEventListeners();
 }
 
-// Data Persistence
-function loadEmails() {
+// Database Fetching & Seeding
+async function fetchEmailsFromSupabase() {
+    try {
+        const { data, error } = await supabase.from('emails').select('*').order('id', { ascending: false });
+        if (error) throw error;
+        
+        if (data.length === 0 && mockEmails) {
+            // Seed database
+            showToast("Seeding database...", "info");
+            
+            // Format mockEmails for DB
+            const seedData = mockEmails.map(e => ({
+                id: e.id,
+                sender: e.sender,
+                senderEmail: e.senderEmail,
+                subject: e.subject,
+                snippet: e.snippet,
+                body: e.body,
+                timestamp: e.timestamp,
+                category: e.category,
+                read: e.read,
+                starred: e.starred,
+                avatar: e.avatar,
+                is_trashed: false,
+                replies: []
+            }));
+
+            const { error: insertError } = await supabase.from('emails').insert(seedData);
+            if (insertError) throw insertError;
+            
+            const { data: newData } = await supabase.from('emails').select('*').order('id', { ascending: false });
+            emails = newData || [];
+        } else {
+            emails = data;
+        }
+    } catch (err) {
+        console.error("Supabase Error:", err);
+        showToast("Failed to fetch emails", "info");
+        loadLocalEmails(); // Fallback
+    }
+}
+
+function loadLocalEmails() {
     const saved = localStorage.getItem('beemail_data');
     if (saved) {
         emails = JSON.parse(saved);
     } else {
-        emails = [...mockEmails];
-        saveEmails();
+        emails = [...mockEmails].map(e => ({...e, is_trashed: false, replies: []}));
+        localStorage.setItem('beemail_data', JSON.stringify(emails));
     }
 }
 
-function saveEmails() {
-    localStorage.setItem('beemail_data', JSON.stringify(emails));
+// Realtime Listener
+function setupRealtimeSubscription() {
+    supabase.channel('custom-all-channel')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'emails' }, payload => {
+        
+        if (payload.eventType === 'INSERT') {
+            // Ensure we don't duplicate if we inserted it ourselves (though IDs might handle this)
+            if (!emails.find(e => e.id === payload.new.id)) {
+                emails.unshift(payload.new);
+            }
+        } else if (payload.eventType === 'UPDATE') {
+            const index = emails.findIndex(e => e.id === payload.new.id);
+            if (index !== -1) {
+                emails[index] = payload.new;
+            }
+        } else if (payload.eventType === 'DELETE') {
+            emails = emails.filter(e => e.id !== payload.old.id);
+        }
+        
+        renderSidebar();
+        renderEmailList();
+        
+        // Refresh detail view if the currently opened email was updated
+        if (selectedEmailId === payload.new?.id || selectedEmailId === payload.old?.id) {
+            renderEmailDetail();
+        }
+    })
+    .subscribe();
+}
+
+// DB Updates
+async function updateEmailInDB(id, updates) {
+    if (supabase) {
+        try {
+            await supabase.from('emails').update(updates).eq('id', id);
+        } catch(err) {
+            console.error("Update failed", err);
+        }
+    } else {
+        localStorage.setItem('beemail_data', JSON.stringify(emails));
+    }
 }
 
 // Toast Notification System
@@ -86,12 +182,7 @@ function showToast(message, type = 'success') {
     
     toastContainer.appendChild(toast);
     
-    // Animate in
-    setTimeout(() => {
-        toast.classList.remove('translate-y-10', 'opacity-0');
-    }, 10);
-    
-    // Animate out and remove
+    setTimeout(() => toast.classList.remove('translate-y-10', 'opacity-0'), 10);
     setTimeout(() => {
         toast.classList.add('opacity-0', '-translate-y-5');
         setTimeout(() => toast.remove(), 300);
@@ -102,7 +193,8 @@ function showToast(message, type = 'success') {
 function renderSidebar() {
     navCategories.innerHTML = '';
     categories.forEach(cat => {
-        const unread = cat.unreadCount ? emails.filter(e => e.category === cat.id && !e.read).length : 0;
+        // Unread logic excludes trashed items
+        const unread = cat.unreadCount ? emails.filter(e => e.category === cat.id && !e.read && !e.is_trashed).length : 0;
         const isActive = currentCategory === cat.id;
         
         const a = document.createElement('a');
@@ -144,14 +236,12 @@ function renderSidebar() {
 
 function changeCategory(categoryId) {
     currentCategory = categoryId;
-    selectedEmailId = null; // reset selection
+    selectedEmailId = null; 
     viewTitle.textContent = categories.find(c => c.id === categoryId)?.label || 'Inbox';
-    if (isMobileDetailView) {
-        closeMobileDetail();
-    }
+    if (isMobileDetailView) closeMobileDetail();
     renderSidebar();
     renderEmailList();
-    renderEmailDetail(); // clear detail view
+    renderEmailDetail(); 
 }
 
 // Render Email List
@@ -159,14 +249,14 @@ function renderEmailList() {
     emailListContainer.innerHTML = '';
     
     let filteredEmails = emails.filter(e => {
-        // Category filter
-        const matchCategory = currentCategory === 'starred' ? e.starred && e.category !== 'trash' : e.category === currentCategory;
-        // Search filter
+        if (currentCategory === 'trash') return e.is_trashed;
+        if (e.is_trashed) return false;
+        
+        const matchCategory = currentCategory === 'starred' ? e.starred : e.category === currentCategory;
         const matchSearch = e.subject.toLowerCase().includes(searchQuery) || e.sender.toLowerCase().includes(searchQuery);
         return matchCategory && matchSearch;
     });
 
-    // Update count display
     emailCountDisplay.textContent = filteredEmails.length;
 
     if (filteredEmails.length === 0) {
@@ -211,13 +301,11 @@ function renderEmailList() {
             </div>
         `;
 
-        // Click row to open detail
         row.addEventListener('click', (e) => {
-            if (e.target.closest('.star-btn')) return; // Ignore if clicking star
+            if (e.target.closest('.star-btn')) return;
             openEmailDetail(email.id);
         });
 
-        // Click star to toggle
         const starBtn = row.querySelector('.star-btn');
         starBtn.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -246,9 +334,8 @@ function renderEmailDetail() {
     const email = emails.find(e => e.id === selectedEmailId);
     if (!email) return;
 
-    const isTrash = email.category === 'trash';
+    const isTrash = email.is_trashed;
 
-    // Generate HTML for thread replies
     const repliesHTML = email.replies && email.replies.length > 0 ? email.replies.map(reply => `
         <div class="flex gap-4 mt-8">
             <img src="${reply.avatar}" class="w-10 h-10 rounded-full object-cover shadow-sm">
@@ -343,18 +430,19 @@ function renderEmailDetail() {
         </div>
     `;
 
+    // Bind Detail Actions
     document.getElementById('toggleReadBtn').addEventListener('click', () => {
         email.read = !email.read;
-        saveEmails();
+        updateEmailInDB(email.id, { read: email.read });
         renderEmailList();
         renderSidebar();
-        renderEmailDetail(); // Update the icon in detail view
+        renderEmailDetail(); 
     });
 
     if (document.getElementById('deleteEmailBtn')) {
         document.getElementById('deleteEmailBtn').addEventListener('click', () => {
-            email.category = 'trash';
-            saveEmails();
+            email.is_trashed = true;
+            updateEmailInDB(email.id, { is_trashed: true });
             showToast("Moved to Trash");
             selectedEmailId = null; 
             renderSidebar();
@@ -366,8 +454,8 @@ function renderEmailDetail() {
 
     if (document.getElementById('restoreEmailBtn')) {
         document.getElementById('restoreEmailBtn').addEventListener('click', () => {
-            email.category = 'inbox'; // Default restore to inbox
-            saveEmails();
+            email.is_trashed = false;
+            updateEmailInDB(email.id, { is_trashed: false });
             showToast("Restored to Inbox");
             selectedEmailId = null; 
             renderSidebar();
@@ -386,31 +474,31 @@ function renderEmailDetail() {
     const replyInput = document.getElementById('replyInput');
     const sendReplyBtn = document.getElementById('sendReplyBtn');
     
-    const submitReply = () => {
+    const submitReply = async () => {
         const text = replyInput.value.trim();
         if (!text) return;
         
         if (!email.replies) email.replies = [];
         
-        email.replies.push({
+        const newReply = {
             id: Date.now(),
             sender: "Me",
             avatar: "https://i.pravatar.cc/150?u=me",
             body: text,
             timestamp: "Just now"
-        });
+        };
         
-        saveEmails();
-        showToast("Reply Sent");
+        email.replies.push(newReply);
         
-        // Re-render detail view to show new message
+        // Optimistic UI
         renderEmailDetail();
-        
-        // Scroll to bottom of detail view
         const detailScrollArea = document.querySelector('#emailDetailContent > div > div:nth-child(3)');
         if (detailScrollArea) {
             detailScrollArea.scrollTop = detailScrollArea.scrollHeight;
         }
+
+        updateEmailInDB(email.id, { replies: email.replies });
+        showToast("Reply Sent");
     };
     
     sendReplyBtn.addEventListener('click', submitReply);
@@ -422,18 +510,16 @@ function renderEmailDetail() {
 function openEmailDetail(id) {
     selectedEmailId = id;
     
-    // Mark as read
     const email = emails.find(e => e.id === id);
     if (email && !email.read) {
         email.read = true;
-        saveEmails();
-        renderSidebar(); // update unread count
+        updateEmailInDB(email.id, { read: true });
+        renderSidebar(); 
     }
 
-    renderEmailList(); // update active state
+    renderEmailList(); 
     renderEmailDetail();
 
-    // Mobile specific logic
     if (window.innerWidth < 768) {
         isMobileDetailView = true;
         emailListCol.classList.add('-translate-x-full');
@@ -457,13 +543,13 @@ function toggleStar(id) {
     const email = emails.find(e => e.id === id);
     if (email) {
         email.starred = !email.starred;
-        saveEmails();
+        updateEmailInDB(email.id, { starred: email.starred });
         renderEmailList();
     }
 }
 
 // Handle Compose Send
-function handleSendEmail() {
+async function handleSendEmail() {
     const to = composeTo.value.trim();
     const subject = composeSubject.value.trim();
     const body = composeBody.value.trim();
@@ -473,8 +559,11 @@ function handleSendEmail() {
         return;
     }
 
+    // Auto-generate numeric ID for mock insertion (Supabase usually uses UUID/int sequence)
+    // We'll let Supabase handle 'id' by excluding it if we use Supabase, 
+    // but we add it for local state rendering until it syncs.
     const newEmail = {
-        id: Date.now(),
+        id: Date.now(), 
         sender: "Me",
         senderEmail: "bilal@beemail.io",
         subject: subject || "(No Subject)",
@@ -485,17 +574,26 @@ function handleSendEmail() {
         read: true,
         starred: false,
         avatar: "https://i.pravatar.cc/150?u=me",
+        is_trashed: false,
         replies: []
     };
 
-    emails.unshift(newEmail);
-    saveEmails();
-
     const originalText = sendEmailBtn.innerHTML;
     sendEmailBtn.innerHTML = `<i class="ph ph-spinner animate-spin text-lg"></i> Sending...`;
-    
-    setTimeout(() => {
-        // Clear form
+
+    try {
+        if (supabase) {
+            // Remove the temporary ID, let the DB generate it
+            const dbEmail = { ...newEmail };
+            delete dbEmail.id;
+            const { error } = await supabase.from('emails').insert([dbEmail]);
+            if (error) throw error;
+        } else {
+            emails.unshift(newEmail);
+            saveEmails();
+        }
+
+        // Cleanup Form & UI
         composeTo.value = '';
         composeSubject.value = '';
         composeBody.value = '';
@@ -503,16 +601,18 @@ function handleSendEmail() {
         closeComposeModal();
         showToast("Message Sent", "success");
         
-        setTimeout(() => { 
-            sendEmailBtn.innerHTML = originalText; 
-            changeCategory('sent'); 
-        }, 300);
-    }, 800);
+        sendEmailBtn.innerHTML = originalText; 
+        changeCategory('sent'); 
+        
+    } catch (err) {
+        console.error("Failed to send email:", err);
+        showToast("Error sending message", "error");
+        sendEmailBtn.innerHTML = originalText;
+    }
 }
 
 function openComposeModal() {
     composeModal.classList.remove('hidden');
-    // Small delay to allow display:block to apply before animating opacity/transform
     setTimeout(() => {
         composeModal.classList.remove('opacity-0');
         composeModalContent.classList.remove('translate-y-full', 'sm:scale-95');
@@ -530,22 +630,18 @@ function closeComposeModal() {
 
 // Event Listeners
 function setupEventListeners() {
-    // Search
     searchInput.addEventListener('input', (e) => {
         searchQuery = e.target.value.toLowerCase();
         renderEmailList();
     });
 
-    // Mobile Back
     mobileBackBtn.addEventListener('click', closeMobileDetail);
 
-    // Compose Modal
     document.getElementById('composeBtn').addEventListener('click', openComposeModal);
     document.getElementById('mobileComposeBtn').addEventListener('click', openComposeModal);
     document.getElementById('closeComposeBtn').addEventListener('click', closeComposeModal);
     sendEmailBtn.addEventListener('click', handleSendEmail);
 
-    // Theme Toggle
     const toggleTheme = () => {
         isDarkMode = !isDarkMode;
         if (isDarkMode) {
@@ -559,10 +655,8 @@ function setupEventListeners() {
     themeToggleBtn.addEventListener('click', toggleTheme);
     mobileThemeBtn.addEventListener('click', toggleTheme);
 
-    // Resize handling for responsive view
     window.addEventListener('resize', checkResponsive);
 
-    // Mobile Nav clicks
     document.querySelectorAll('.nav-item-mobile').forEach(btn => {
         btn.addEventListener('click', (e) => {
             changeCategory(btn.dataset.cat);
@@ -572,21 +666,20 @@ function setupEventListeners() {
 
 function checkResponsive() {
     if (window.innerWidth >= 768) {
-        // Desktop
         emailListCol.classList.remove('-translate-x-full');
         emailDetailCol.classList.remove('translate-x-full');
         mobileBackBtn.classList.add('hidden');
         mobileLogo.classList.remove('hidden');
         
-        // Auto-select first email if none selected
         if (!selectedEmailId && currentCategory !== 'drafts') {
-            const visibleEmails = emails.filter(e => currentCategory === 'starred' ? e.starred && e.category !== 'trash' : e.category === currentCategory);
-            if(visibleEmails.length > 0) {
-                openEmailDetail(visibleEmails[0].id);
-            }
+            const visibleEmails = emails.filter(e => {
+                if (currentCategory === 'trash') return e.is_trashed;
+                if (e.is_trashed) return false;
+                return currentCategory === 'starred' ? e.starred : e.category === currentCategory;
+            });
+            if(visibleEmails.length > 0) openEmailDetail(visibleEmails[0].id);
         }
     } else {
-        // Mobile
         if (!isMobileDetailView) {
             emailDetailCol.classList.add('translate-x-full');
             emailListCol.classList.remove('-translate-x-full');
@@ -597,5 +690,4 @@ function checkResponsive() {
     }
 }
 
-// Run app
 document.addEventListener('DOMContentLoaded', init);
